@@ -2,17 +2,21 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 
+	"github.com/m1rl0k/GoSecretScanv2/pkg/baseline"
+	"github.com/m1rl0k/GoSecretScanv2/pkg/config"
 	"github.com/m1rl0k/GoSecretScanv2/pkg/verification"
 )
 
@@ -26,64 +30,237 @@ const (
 )
 
 var (
+	// Comprehensive secret patterns - organized by provider/type
+	// Patterns are ordered from most specific to most generic to minimize false positives
 	secretPatterns = []string{
-		`(?i)_(Private_Key):[-]{5}BEGIN\\s(?:[DR]SA|OPENSSH|EC|PGP)\\sPRIVATE\\sKEY(?:\\sBLOCK)?[-]{5}`,
-		`(?i)_(AWS_Key):[\\s'\"=]A[KS]IA[0-9A-Z]{16}[\\s'\"]`,
-		`(?i)_(AWS_Key_line_end):[\\s=]A[KS]IA[0-9A-Z]{16}$`,
-		`(?i)_(Slack_token):xox[pboa]-[0-9]{11,12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32}`,
-		`(?i)_(Basic_Auth):Authorization:\\sBasic\\s(?:[a-zA-Z0-9\\+/]{4})*(?:[a-zA-Z0-9\\+/]{3}=|[a-zA-Z0-9\\+/]{2}==)?(?:$|[\\s;'\"])`,
-		`(?i)_(Basic_Auth_Only_Pattern):Basic\\s(?:[a-zA-Z0-9\\+/]{4})*(?:[a-zA-Z0-9\\+/]{3}=|[a-zA-Z0-9\\+/]{2}==)?(?:$|[\\s;'\"])`,
-		`(?i)(aws_secret_access_key|aws_access_key_id|password|pass|passwd|user|username|key|apikey|accesskey|secret)[\\s\\r\\n]*=[\\s\\r\\n]*('[^']*'|\"[^\"]*\")`,
-		`(?i)(client_id|client_secret|subscription_id|tenant_id|access_key|account_key|primary_access_key|secondary_access_key)[\\s\\r\\n]*=[\\s\\r\\n]*('[^']*'|\"[^\"]*\")`,
-		`(?i)provider\\s*\"azurerm\"\\s*{\\s*features\\s*{\\s*}\\s*subscription_id\\s*=\\s*\"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\"\\s*tenant_id\\s*=\\s*\"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\"\\s*client_id\\s*=\\s*\"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\"\\s*client_secret\\s*=\\s*\"([^\\s]+)\"\\s*}`,
-		`(?i)(api|app|client)_?(key|id|secret)(\s*[:=]\s*|\s*['"])([\w\-\/+]{10,})(\s*['"])`,
-		`(?i)(username|password)\s*=\s*('[^']*'|\"[^\"]*\")`,
-		`(?i)aws_access_key_id\s*=\s*"AKIA[0-9A-Z]{16}"`,
-		`(?i)aws_secret_access_key\s*=\s*"[0-9a-zA-Z/+]{40}"`,
-		`(?i)api_key(?:\s*[:=]\s*|\s*["'\s])?([a-zA-Z0-9_\-]{32,})`,
-		`(?i)password(?:\s*[:=]\s*|\s*["'\s])?([a-zA-Z0-9!@#$%^&*()_+]{8,})`,
-		`(?i)azure_client_(?:id|secret)\s*=\s*"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"`,
-		`(?i)azure_tenant_id\s*=\s*"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"`,
-		`(?i)azure_subscription_id\s*=\s*"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"`,
-		`(?i)google_application_credentials\s*=\s*"([a-zA-Z0-9\-]+\.json)"`,
-		`(?i)google_client_(?:id|secret)\s*=\s*"([0-9]{12}-[a-zA-Z0-9_]{32})"`,
-		`(?i)google_project(?:\s*[:=]\s*|\s*["'\s])?([a-z][a-z0-9-]{4,28}[a-z0-9])`,
-		`(?i)google_credentials(?:\s*[:=]\s*|\s*["'\s])?([a-zA-Z0-9\-]+\.json)"`,
-		`(?i)private_key(?:_id)?\s*=\s*"([0-9a-f]{64})"`,
-		`(?i)client_email\s*=\s*"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Z]{2,})"`,
-		`(?i)client_id\s*=\s*"([0-9]{12}-[a-zA-Z0-9_]{32})"`,
-		`(?i)client_secret\s*=\s*"([a-zA-Z0-9_]{24})"`,
-		`(?i)client_x509_cert_url\s*=\s*"(https://[a-z0-9\-]+\.googleusercontent\.com/[^"']{1,200})"`,
-		`(?i)token_uri\s*=\s*"(https://(?:accounts\.)?google\.com/o/oauth2/token)"`,
-		`(?i)auth_uri\s*=\s*"(https://(?:accounts\.)?google\.com/o/oauth2/auth)"`,
-		`(?i)_(AWS_STS_Token):FQoG.*[^\\w]`,                                                                                               // AWS Security Token Service (STS) token
-		`(?i)_(AWS_Access_Key_ID):[^\\w]AKIA[0-9A-Z]{16}[^\\w]`,                                                                           // AWS access key ID
-		`(?i)_(API_Key):[^\\w]Bearer [0-9a-f]{32}`,                                                                                        // API key
-		`(?i)_(AWS_Secret_Key):[\\s'\"=]AKIA[0-9A-Z]{16}[\\s'\"$]`,                                                                        // AWS secret access key
-		`(?i)_(Basic_Auth2):Authorization:\\sBasic\\s(?:[a-zA-Z0-9\\+/]{4})*(?:[a-zA-Z0-9\\+/]{3}=|[a-zA-Z0-9\\+/]{2}==)?(?:$|[\\s;'\"])`, // Basic auth token
-		`(?i)_(SSH_Key):-{5}BEGIN\\s(?:[DR]SA|OPENSSH|EC|PGP)\\sPRIVATE\\sKEY(?:\\sBLOCK)?-{5}`,                                           // SSH private key
-		`(?i)_(RSA_Key):-{5}BEGIN\\sRSA\\sPRIVATE\\sKEY(?:\\sBLOCK)?-{5}`,                                                                 // RSA private key
-		`(?i)_(Private_Key):-----BEGIN PRIVATE KEY-----[^-]+-----END PRIVATE KEY-----`,                                                    // Private key
-		`(?i)_(PGP_Private_Key):-----BEGIN PGP PRIVATE KEY BLOCK----[^-]+-----END PGP PRIVATE KEY BLOCK-----`,                             // PGP private key
-		`(?i)_(GCP_API_Key):[^\\w]AIza[0-9A-Za-z_-]{35}[^\\w]`,                                                                            // Google Cloud Platform (GCP) API key
-		`(?i)_(SecretsAWS):[^\\w](aws_secret_access_key|aws_access_key_id|password|pass|passwd|user|username|key|apikey|accesskey|secret)[\\s\\r\\n]*=[\\s\\r\\n]*('[^']*'|\"[^\"]*\")[^\\w]`,
-		`(?i)_(SecretsAZURE):[^\\w](client_id|client_secret|subscription_id|tenant_id|access_key|account_key|primary_access_key|secondary_access_key)[\\s\\r\\n]*=[\\s\\r\\n]*('[^']*'|\"[^\"]*\")[^\\w]`, // Azure secret
-		`(?i)_(GitHub_API_Token):[^\\w]ghp_[A-Za-z0-9_]{30,40}`, // GitHub API token
-		`(?i)_(Keys):(?:(?:a(?:ws|ccess|p(?:i|p(?:lication)?)))|private|se(?:nsitive|cret))[\\s_-]?key\\s{1,20}[=:]{1,2}\\s{0,20}['\"]?(?:[^\\sa-z;'\",\\/._-][a-z0-9!?$)=<\/>%@#*&{}_^-]{0,1000})[\\s;'\",]`,
-		`(?i)_(Keys_no_space):(?:(?:a(?:ws|ccess|p(?:i|p(?:lication)?)))|private|se(?:nsitive|cret))[\\s_-]?key[=:]{1,2}\\s{0,20}['\"]?(?:[^\\sa-z;',\\/._-][a-z0-9!?$)=<\/>%@#*&{}_^-]{0,1000})[\\s;',]`,
-		`(?i)_(Password_Generic_with_quotes):(?:(?:pass(?:w(?:or)?d)?)|(?:p(?:s)?w(?:r)?d)|secret)['\"]?\\s{0,20}[=:]{1,3}\\s{0,20}[@]?['\"]([^\\sa-z;'\",\\/._-][a-z0-9!?$)=<\/>%@#*&{}_^-]{0,45})['\"]`,
-		`(?i)_(Password_equal_no_quotes):(?:(?:pass(?:w(?:or)?d)?)|(?:p(?:s)?w(?:r)?d)|secret)\s{0,20}[=]\s{0,20}([a-z0-9!?$)=<\/>%@#*&{}_^-]{0,45}[^\\sa-z;',\\/._-][a-z0-9!?$)=<\/>%@#*&{}_^-]{0,45})(?:(?:<\/)|[\s;',]|$)`,
-		`(?i)_(Password_value):(?:(?:pass(?:w(?:or)?d)?)|(?:p(?:s)?w(?:r)?d)|secret).{0,10}value[=]['\"]([^\\sa-z;'\",\\/._-][a-z0-9!?$)=<\/>%@#*&{}_^-]{0,45})['\"]`,
-		`(?i)_(Password_primary):(?:(?:pass(?:w(?:or)?d)?)|(?:p(?:s)?w(?:r)?d)|secret)\\sprimary[=]['\"]([^\\sa-z;'\",\\/._-][a-z0-9!?$)=<\/>%@#*&{}_^-]{0,45})(?:['"\\s;,\"]|$)`,
-		`(?i)encryPublicKey\s*=\s*\"([A-Za-z0-9+/=\r\n]+)\"`,
-		`(?i)decryPrivateKey\s*=\s*\"([A-Za-z0-9+/=\r\n]+)\"`,
-		`(?i)AIza[0-9A-Za-z_-]{29,45}`,
-		`(?i)sk_(?:live|test)_[0-9A-Za-z]{24,}`,
-		`(?i)xox(?:p|b|o|a|r)-[0-9A-Za-z-]{10,}`,
-		`(?i)-----BEGIN\sPRIVATE\sKEY-----`,
-		`(?i)(?:postgres|mysql|mariadb|mongodb|redis)://[^:\\s]+:[^@\\s]+@[^/\\s]+`,
-		`(?i)AKIA[0-9A-Z]{16}`,
-		`(?i)ghp_[A-Za-z0-9]{30,}`,
+		// ===== CLOUD PROVIDERS =====
+		// AWS
+		`AKIA[0-9A-Z]{16}`, // AWS Access Key ID
+		`ABIA[0-9A-Z]{16}`, // AWS STS Service Bearer Token
+		`ACCA[0-9A-Z]{16}`, // AWS Context-specific credentials
+		`ASIA[0-9A-Z]{16}`, // AWS Temporary (STS) Access Key
+		`(?i)aws_?secret_?access_?key["'\s:=]+[A-Za-z0-9/+=]{40}`, // AWS Secret Access Key
+		`(?i)aws_?session_?token["'\s:=]+[A-Za-z0-9/+=]{100,}`,    // AWS Session Token
+		// GCP / Google
+		`AIza[0-9A-Za-z_-]{35}`,                                 // Google API Key
+		`(?i)google_?api_?key["'\s:=]+AIza[0-9A-Za-z_-]{35}`,    // Google API Key with label
+		`[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com`, // Google OAuth Client ID
+		`ya29\.[0-9A-Za-z_-]+`,                                  // Google OAuth Access Token
+		// Azure
+		`(?i)azure[_-]?(?:client|tenant|subscription)[_-]?(?:id|secret)["'\s:=]+[0-9a-f-]{36}`, // Azure IDs
+		`(?i)(?:DefaultEndpointsProtocol|AccountName|AccountKey)=[^;\s"']+`,                    // Azure Storage Connection String
+		`(?i)SharedAccessSignature=sv=[^;\s"']+`,                                               // Azure SAS Token
+		// IBM Cloud
+		`(?i)ibm[_-]?(?:api[_-]?key|cloud[_-]?key)["'\s:=]+[A-Za-z0-9_-]{44}`, // IBM Cloud API Key
+		// Alibaba Cloud
+		`LTAI[0-9A-Za-z]{20}`, // Alibaba Cloud Access Key ID
+		// DigitalOcean
+		`dop_v1_[0-9a-f]{64}`, // DigitalOcean Personal Access Token
+		`doo_v1_[0-9a-f]{64}`, // DigitalOcean OAuth Token
+		// Linode
+		`(?i)linode[_-]?(?:api[_-]?)?token["'\s:=]+[0-9a-f]{64}`, // Linode API Token
+		// Vultr
+		`(?i)vultr[_-]?api[_-]?key["'\s:=]+[A-Z0-9]{36}`, // Vultr API Key
+		// Heroku
+		`(?i)heroku[_-]?api[_-]?key["'\s:=]+[0-9a-f-]{36}`,             // Heroku API Key
+		`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`, // Heroku OAuth Token (UUID format)
+
+		// ===== VERSION CONTROL =====
+		// GitHub
+		`ghp_[A-Za-z0-9]{36}`,                        // GitHub Personal Access Token
+		`gho_[A-Za-z0-9]{36}`,                        // GitHub OAuth Access Token
+		`ghu_[A-Za-z0-9]{36}`,                        // GitHub User-to-Server Token
+		`ghs_[A-Za-z0-9]{36}`,                        // GitHub Server-to-Server Token
+		`ghr_[A-Za-z0-9]{36}`,                        // GitHub Refresh Token
+		`github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}`, // GitHub Fine-grained PAT
+		// GitLab
+		`glpat-[A-Za-z0-9_-]{20}`,    // GitLab Personal Access Token
+		`glptt-[A-Za-z0-9_-]{40}`,    // GitLab Pipeline Trigger Token
+		`GR1348941[A-Za-z0-9_-]{20}`, // GitLab Runner Token
+		// Bitbucket
+		`(?i)bitbucket[_-]?(?:api[_-]?)?(?:key|token|secret)["'\s:=]+[A-Za-z0-9]{32}`, // Bitbucket tokens
+
+		// ===== CI/CD =====
+		// CircleCI
+		`(?i)circle[_-]?(?:ci[_-]?)?token["'\s:=]+[0-9a-f]{40}`, // CircleCI Token
+		// Travis CI
+		`(?i)travis[_-]?(?:ci[_-]?)?token["'\s:=]+[A-Za-z0-9]{22}`, // Travis CI Token
+		// Jenkins
+		`(?i)jenkins[_-]?(?:api[_-]?)?token["'\s:=]+[0-9a-f]{32,34}`, // Jenkins API Token
+		// Drone CI
+		`(?i)drone[_-]?token["'\s:=]+[A-Za-z0-9]{32}`, // Drone CI Token
+
+		// ===== PAYMENT PROCESSORS =====
+		// Stripe
+		`sk_live_[0-9a-zA-Z]{24,}`, // Stripe Live Secret Key
+		`sk_test_[0-9a-zA-Z]{24,}`, // Stripe Test Secret Key
+		`rk_live_[0-9a-zA-Z]{24,}`, // Stripe Live Restricted Key
+		`rk_test_[0-9a-zA-Z]{24,}`, // Stripe Test Restricted Key
+		`pk_live_[0-9a-zA-Z]{24,}`, // Stripe Live Publishable Key
+		`pk_test_[0-9a-zA-Z]{24,}`, // Stripe Test Publishable Key
+		`whsec_[0-9a-zA-Z]{32,}`,   // Stripe Webhook Secret
+		// Square
+		`sq0atp-[0-9A-Za-z_-]{22}`, // Square Access Token
+		`sq0csp-[0-9A-Za-z_-]{43}`, // Square OAuth Secret
+		`EAAAE[A-Za-z0-9]{59}`,     // Square Production Application Secret
+		// PayPal
+		`(?i)paypal[_-]?(?:client[_-]?)?secret["'\s:=]+[A-Za-z0-9]{32,}`, // PayPal Secret
+		// Braintree
+		`(?i)braintree[_-]?(?:private[_-]?)?key["'\s:=]+[a-f0-9]{32}`, // Braintree Private Key
+
+		// ===== COMMUNICATION =====
+		// Slack
+		`xoxp-[0-9]{10,13}-[0-9]{10,13}-[0-9]{10,13}-[a-z0-9]{32}`,              // Slack User Token
+		`xoxb-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{20,}`,                       // Slack Bot Token
+		`xoxa-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{20,}`,                       // Slack App Token
+		`xoxr-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{20,}`,                       // Slack Refresh Token
+		`https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+`, // Slack Webhook URL
+		// Discord
+		`(?i)discord[_-]?(?:bot[_-]?)?token["'\s:=]+[MN][A-Za-z0-9]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}`, // Discord Bot Token
+		`https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+`,                                      // Discord Webhook URL
+		// Twilio
+		`AC[0-9a-f]{32}`, // Twilio Account SID
+		`SK[0-9a-f]{32}`, // Twilio API Key SID
+		`(?i)twilio[_-]?auth[_-]?token["'\s:=]+[0-9a-f]{32}`, // Twilio Auth Token
+		// Telegram
+		`[0-9]{8,10}:[A-Za-z0-9_-]{35}`, // Telegram Bot Token
+		// SendGrid
+		`SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`, // SendGrid API Key
+		// Mailgun
+		`key-[0-9a-zA-Z]{32}`, // Mailgun API Key
+		`(?i)mailgun[_-]?api[_-]?key["'\s:=]+key-[0-9a-zA-Z]{32}`, // Mailgun API Key with label
+		// Mailchimp
+		`[0-9a-f]{32}-us[0-9]{1,2}`, // Mailchimp API Key
+		// Postmark
+		`(?i)postmark[_-]?(?:api[_-]?)?(?:token|key)["'\s:=]+[0-9a-f-]{36}`, // Postmark API Token
+
+		// ===== DATABASES =====
+		`(?i)(?:mongodb|mongo)(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s/]+`,       // MongoDB Connection String
+		`(?i)postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s/]+`,                   // PostgreSQL Connection String
+		`(?i)mysql://[^:\s]+:[^@\s]+@[^\s/]+`,                             // MySQL Connection String
+		`(?i)redis://[^:\s]*:[^@\s]+@[^\s/]+`,                             // Redis Connection String (with auth)
+		`(?i)amqp://[^:\s]+:[^@\s]+@[^\s/]+`,                              // RabbitMQ Connection String
+		`(?i)(?:jdbc:)?(?:mysql|postgresql|oracle|sqlserver)://[^;\s"']+`, // JDBC Connection Strings
+
+		// ===== PACKAGE MANAGERS =====
+		`npm_[A-Za-z0-9]{36}`,                                        // npm Access Token
+		`(?i)_auth\s*=\s*[A-Za-z0-9+/=]{50,}`,                        // npm _auth token (base64)
+		`pypi-[A-Za-z0-9_-]{50,}`,                                    // PyPI API Token
+		`rubygems_[0-9a-f]{48}`,                                      // RubyGems API Key
+		`(?i)gem[_-]?(?:host[_-]?)?api[_-]?key["'\s:=]+[0-9a-f]{48}`, // RubyGems with label
+		`GOPRIVATE.*token.*[A-Za-z0-9_-]{40}`,                        // Go private module token
+		`nuget[_-]?api[_-]?key["'\s:=]+[a-z0-9-]{36}`,                // NuGet API Key
+
+		// ===== CONTAINER REGISTRIES =====
+		`(?i)docker[_-]?(?:hub[_-]?)?(?:password|token)["'\s:=]+[A-Za-z0-9_-]{36,}`, // Docker Hub
+		`(?i)(?:ghcr|gcr|acr|ecr)[_-]?token["'\s:=]+[A-Za-z0-9_-]{36,}`,             // Container registry tokens
+
+		// ===== MONITORING / ANALYTICS =====
+		// Datadog
+		`(?i)(?:datadog|dd)[_-]?api[_-]?key["'\s:=]+[a-f0-9]{32}`, // Datadog API Key
+		`(?i)(?:datadog|dd)[_-]?app[_-]?key["'\s:=]+[a-f0-9]{40}`, // Datadog App Key
+		// New Relic
+		`NRAK-[A-Z0-9]{27}`, // New Relic API Key
+		`(?i)new[_-]?relic[_-]?license[_-]?key["'\s:=]+[a-f0-9]{40}`, // New Relic License Key
+		// Sentry
+		`https://[a-f0-9]{32}@(?:o[0-9]+\.)?ingest\.sentry\.io/[0-9]+`, // Sentry DSN
+		// PagerDuty
+		`(?i)pagerduty[_-]?(?:api[_-]?)?(?:token|key)["'\s:=]+[A-Za-z0-9+_-]{20}`, // PagerDuty Token
+		// Splunk
+		`(?i)splunk[_-]?(?:hec[_-]?)?token["'\s:=]+[0-9a-f-]{36}`, // Splunk HEC Token
+
+		// ===== AUTHENTICATION =====
+		// Auth0
+		`(?i)auth0[_-]?(?:client[_-]?)?secret["'\s:=]+[A-Za-z0-9_-]{32,}`, // Auth0 Client Secret
+		// Okta
+		`(?i)okta[_-]?(?:api[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{42}`, // Okta API Token
+		// Firebase
+		`(?i)firebase[_-]?(?:api[_-]?)?key["'\s:=]+AIza[0-9A-Za-z_-]{35}`, // Firebase API Key
+		`AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}`,                         // Firebase Cloud Messaging Token
+
+		// ===== CRYPTOGRAPHIC KEYS =====
+		`-----BEGIN\s(?:RSA\s)?PRIVATE\sKEY-----`,   // RSA Private Key
+		`-----BEGIN\sOPENSSH\sPRIVATE\sKEY-----`,    // OpenSSH Private Key
+		`-----BEGIN\sEC\sPRIVATE\sKEY-----`,         // EC Private Key
+		`-----BEGIN\sPGP\sPRIVATE\sKEY\sBLOCK-----`, // PGP Private Key
+		`-----BEGIN\sDSA\sPRIVATE\sKEY-----`,        // DSA Private Key
+		`-----BEGIN\sENCRYPTED\sPRIVATE\sKEY-----`,  // Encrypted Private Key
+
+		// ===== JWT / OAUTH =====
+		`eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`,  // JWT Token
+		`(?i)bearer\s+[A-Za-z0-9_-]{20,}\.?[A-Za-z0-9_-]*\.?[A-Za-z0-9_-]*`, // Bearer Token
+		`(?i)oauth[_-]?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{20,}`,    // OAuth Access Token
+
+		// ===== MISC SERVICES =====
+		// Shopify
+		`shppa_[a-f0-9]{32}`, // Shopify Private App Password
+		`shpat_[a-f0-9]{32}`, // Shopify Access Token
+		`shpss_[a-f0-9]{32}`, // Shopify Shared Secret
+		// Atlassian
+		`(?i)atlassian[_-]?api[_-]?token["'\s:=]+[A-Za-z0-9]{24}`, // Atlassian API Token
+		// Airtable
+		`(?i)airtable[_-]?api[_-]?key["'\s:=]+key[A-Za-z0-9]{14}`, // Airtable API Key
+		// Asana
+		`(?i)asana[_-]?(?:access[_-]?)?token["'\s:=]+[0-9]/[0-9]{16}:[A-Za-z0-9]{32}`, // Asana Token
+		// Zendesk
+		`(?i)zendesk[_-]?api[_-]?token["'\s:=]+[A-Za-z0-9]{40}`, // Zendesk API Token
+		// Intercom
+		`(?i)intercom[_-]?(?:access[_-]?)?token["'\s:=]+dG9[A-Za-z0-9+/=]+`, // Intercom Access Token (base64)
+		// Dropbox
+		`sl\.[A-Za-z0-9_-]{130,}`, // Dropbox Access Token
+		// Box
+		`(?i)box[_-]?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9]{32}`, // Box Access Token
+		// Cloudflare
+		`(?i)cloudflare[_-]?(?:api[_-]?)?(?:token|key)["'\s:=]+[A-Za-z0-9_-]{37,}`, // Cloudflare API Token
+		// Netlify
+		`(?i)netlify[_-]?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{40,}`, // Netlify Token
+		// Vercel
+		`(?i)vercel[_-]?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9]{24}`, // Vercel Token
+		// Supabase
+		`sbp_[a-f0-9]{40}`, // Supabase Service Key
+		`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`, // Supabase JWT (specific header)
+		// Linear
+		`lin_api_[A-Za-z0-9]{40}`, // Linear API Key
+		// Notion
+		`secret_[A-Za-z0-9]{43}`, // Notion Integration Token
+		// Figma
+		`figd_[A-Za-z0-9_-]{40,}`, // Figma Personal Access Token
+		// OpenAI
+		`sk-[A-Za-z0-9]{48}`, // OpenAI API Key
+		// Anthropic
+		`sk-ant-[A-Za-z0-9_-]{80,}`, // Anthropic API Key
+		// Hugging Face
+		`hf_[A-Za-z0-9]{34}`, // Hugging Face Token
+		// Replicate
+		`r8_[A-Za-z0-9]{40}`, // Replicate API Token
+		// Mapbox
+		`pk\.[A-Za-z0-9]{60,}`, // Mapbox Public Key
+		`sk\.[A-Za-z0-9]{60,}`, // Mapbox Secret Key
+		// Algolia
+		`(?i)algolia[_-]?(?:admin[_-]?)?api[_-]?key["'\s:=]+[a-f0-9]{32}`, // Algolia Admin API Key
+		// Segment
+		`(?i)segment[_-]?(?:write[_-]?)?key["'\s:=]+[A-Za-z0-9]{32}`, // Segment Write Key
+		// Mixpanel
+		`(?i)mixpanel[_-]?(?:api[_-]?)?(?:token|secret)["'\s:=]+[a-f0-9]{32}`, // Mixpanel Token
+		// Amplitude
+		`(?i)amplitude[_-]?api[_-]?key["'\s:=]+[a-f0-9]{32}`, // Amplitude API Key
+		// LaunchDarkly
+		`(?i)launchdarkly[_-]?(?:sdk[_-]?)?key["'\s:=]+sdk-[a-f0-9-]{36}`, // LaunchDarkly SDK Key
+
+		// ===== GENERIC HIGH-SIGNAL PATTERNS =====
+		`(?i)(?:api|app|application)[_-]?key["'\s:=]+[A-Za-z0-9_-]{20,}`,      // Generic API Key
+		`(?i)(?:api|app|application)[_-]?secret["'\s:=]+[A-Za-z0-9_-]{20,}`,   // Generic API Secret
+		`(?i)secret[_-]?key["'\s:=]+[A-Za-z0-9_-]{20,}`,                       // Generic Secret Key
+		`(?i)access[_-]?token["'\s:=]+[A-Za-z0-9_-]{20,}`,                     // Generic Access Token
+		`(?i)auth[_-]?token["'\s:=]+[A-Za-z0-9_-]{20,}`,                       // Generic Auth Token
+		`(?i)private[_-]?key["'\s:=]+[A-Za-z0-9_-]{20,}`,                      // Generic Private Key
+		`(?i)signing[_-]?(?:key|secret)["'\s:=]+[A-Za-z0-9_-]{20,}`,           // Signing Key/Secret
+		`(?i)encryption[_-]?key["'\s:=]+[A-Za-z0-9_-]{16,}`,                   // Encryption Key
+		`(?i)(?:master|root)[_-]?(?:key|password|secret)["'\s:=]+[^\s"']{8,}`, // Master/Root credentials
+		`(?i)password["'\s:=]+[^\s"']{8,64}`,                                  // Generic Password assignment
+
+		// ===== URLS WITH CREDENTIALS =====
+		`(?i)https?://[^:\s]+:[^@\s]+@[^\s/]+`, // URL with embedded credentials
 	}
 	// Pre-compiled regex patterns for performance
 	compiledPatterns []*regexp.Regexp
@@ -91,7 +268,12 @@ var (
 	bracePlaceholderPattern   = regexp.MustCompile(`\$\{[^}]+\}`)
 	percentPlaceholderPattern = regexp.MustCompile(`%[A-Za-z0-9_]+%`)
 	dollarPlaceholderPattern  = regexp.MustCompile(`\$[A-Z0-9_]+`)
+
+	// Pre-compiled pattern for detecting regex definition lines (to skip self-matches)
+	regexLinePattern = regexp.MustCompile("^\\s*`.*(?:\\(\\?i\\)|\\\\s|\\\\d|\\[|\\]|\\{|\\}|\\||\\^|\\$).*`")
 )
+
+const ruleIDFmt = "pattern-%d"
 
 type Secret struct {
 	File               string  `json:"-"`
@@ -126,12 +308,28 @@ var (
 	excludeGlobs   = flag.String("exclude-glob", "", "Comma-separated glob patterns to exclude (relative paths)")
 	includeExts    = flag.String("include-ext", "", "Comma-separated list of file extensions to include (e.g. .go,.py)")
 	maxFileSizeCli = flag.Int64("max-file-size", maxFileSizeBytes, "Maximum file size to scan in bytes")
+	configPath     = flag.String("config", "", "Path to config file (default: .gosecretscanner.json in repo root)")
+	baselinePath   = flag.String("baseline", "", "Path to baseline file for suppressing known findings")
+	updateBaseline = flag.Bool("update-baseline", false, "Update the baseline file with current findings")
+	baselineReason = flag.String("baseline-reason", "", "Reason for adding findings to baseline (used with --update-baseline)")
+
+	// Git history scanning flags (git history is scanned by default)
+	noGitHistory  = flag.Bool("no-git-history", false, "Skip scanning git commit history")
+	gitMaxCommits = flag.Int("git-max-commits", 0, "Maximum number of commits to scan (0 = all, scans entire history)")
+	gitRef        = flag.String("git-ref", "HEAD", "Git ref to start scanning from")
+	gitSinceDate  = flag.String("git-since", "", "Only scan commits after this date (e.g., 2024-01-01)")
 
 	// Derived settings from flags
 	maxFileSizeLimit int64 = maxFileSizeBytes
 	includeGlobList  []string
 	excludeGlobList  []string
 	includeExtList   []string
+
+	// Loaded configuration
+	compiledConfig *config.CompiledConfig
+
+	// Loaded baseline
+	loadedBaseline *baseline.Baseline
 )
 
 func init() {
@@ -182,10 +380,64 @@ func main() {
 		}
 	}
 
+	// Get working directory for config loading
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error getting current working directory:", err)
+		os.Exit(1)
+	}
+
+	// Load configuration
+	cfg, err := config.Load(*configPath, dir)
+	if err != nil {
+		fmt.Printf("%sError loading config: %v%s\n", RedColor, err, ResetColor)
+		os.Exit(1)
+	}
+
+	compiledConfig, err = cfg.Compile()
+	if err != nil {
+		fmt.Printf("%sError compiling config: %v%s\n", RedColor, err, ResetColor)
+		os.Exit(1)
+	}
+
+	// Apply config overrides for max file size if not overridden via CLI
+	if *maxFileSizeCli == maxFileSizeBytes && compiledConfig.GetMaxFileSize() != maxFileSizeBytes {
+		maxFileSizeLimit = compiledConfig.GetMaxFileSize()
+	}
+
+	// Merge config allowlist paths with CLI exclude globs
+	for _, p := range cfg.Allowlist.Paths {
+		excludeGlobList = append(excludeGlobList, filepath.ToSlash(p))
+	}
+
+	// Helper to print status messages (stderr for JSON/SARIF, stdout for text)
+	outFmt := *outputFormat
+	statusPrint := func(format string, args ...interface{}) {
+		if outFmt == "json" || outFmt == "sarif" {
+			fmt.Fprintf(os.Stderr, format, args...)
+		} else {
+			fmt.Printf(format, args...)
+		}
+	}
+
+	// Load baseline ONLY if explicitly specified via --baseline flag
+	// Baseline is opt-in - by default we report ALL findings
+	loadedBaseline = baseline.New()
+	if *baselinePath != "" {
+		loadedBaseline, err = baseline.Load(*baselinePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%sError loading baseline: %v%s\n", RedColor, err, ResetColor)
+			os.Exit(1)
+		}
+		if loadedBaseline.Count() > 0 {
+			statusPrint("%sLoaded baseline with %d known findings (will be suppressed)%s\n", YellowColor, loadedBaseline.Count(), ResetColor)
+		}
+	}
+
 	// Initialize verification pipeline if LLM is enabled
 	var pipeline *verification.Pipeline
 	if *enableLLM {
-		config := &verification.Config{
+		pipelineConfig := &verification.Config{
 			Enabled:             true,
 			DBPath:              *dbPath,
 			ModelPath:           *modelPath,
@@ -195,85 +447,138 @@ func main() {
 			LLMEndpoint:         *llmEndpoint,
 		}
 
-		var err error
-		pipeline, err = verification.NewPipeline(config)
+		pipeline, err = verification.NewPipeline(pipelineConfig)
 		if err != nil {
-			fmt.Printf("%sWarning: Failed to initialize LLM pipeline: %v%s\n", YellowColor, err, ResetColor)
-			fmt.Printf("%sContinuing with standard detection only...%s\n\n", YellowColor, ResetColor)
+			statusPrint("%sWarning: Failed to initialize LLM pipeline: %v%s\n", YellowColor, err, ResetColor)
+			statusPrint("%sContinuing with standard detection only...%s\n\n", YellowColor, ResetColor)
 			pipeline = nil
 		} else {
-			fmt.Printf("%sLLM verification enabled%s\n\n", GreenColor, ResetColor)
+			statusPrint("%sLLM verification enabled%s\n\n", GreenColor, ResetColor)
 			defer pipeline.Close()
 		}
 	}
 
-	dir, err := os.Getwd()
-	if err != nil {
-		fmt.Println("Error getting current working directory:", err)
-		os.Exit(1)
-	}
-
 	var secretsFound []Secret
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var historySecrets []Secret
 
-	// Bounded worker pool for stable scanning on large repos
-	workers := runtime.NumCPU() * 4
-	if workers < 8 {
-		workers = 8
+	// Check if we're in a git repo
+	isGitRepo := false
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		isGitRepo = true
 	}
-	if workers > 64 {
-		workers = 64
-	}
-	sem := make(chan struct{}, workers)
 
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	// PHASE 1: Scan current working directory files (with LLM verification if enabled)
+	statusPrint("Phase 1: Scanning current files...\n")
+	{
+		// Normal file system scanning
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
+		// Bounded worker pool for stable scanning on large repos
+		workers := runtime.NumCPU() * 4
+		if workers < 8 {
+			workers = 8
 		}
-
-		rel, relErr := filepath.Rel(dir, path)
-		if relErr != nil {
-			rel = path
+		if workers > 64 {
+			workers = 64
 		}
-		rel = filepath.ToSlash(rel)
+		sem := make(chan struct{}, workers)
 
-		if info.IsDir() {
-			if shouldIgnoreDir(path) || shouldSkipDirByUserFilters(rel) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if shouldIgnoreFile(info) {
-			return nil
-		}
-
-		if shouldSkipFileByUserFilters(rel, info) {
-			return nil
-		}
-
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(p string) {
-			defer func() { <-sem; wg.Done() }()
-			secrets, err := scanFileForSecrets(p, pipeline)
+		err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				fmt.Printf("Error scanning file %s: %v\n", p, err)
-				return
+				return err
 			}
-			mu.Lock()
-			secretsFound = append(secretsFound, secrets...)
-			mu.Unlock()
-		}(path)
-		return nil
-	})
-	if err != nil {
-		fmt.Println("Error walking the directory:", err)
-		os.Exit(1)
+
+			rel, relErr := filepath.Rel(dir, path)
+			if relErr != nil {
+				rel = path
+			}
+			rel = filepath.ToSlash(rel)
+
+			if info.IsDir() {
+				if shouldIgnoreDir(path) || shouldSkipDirByUserFilters(rel) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			if shouldIgnoreFile(info) {
+				return nil
+			}
+
+			if shouldSkipFileByUserFilters(rel, info) {
+				return nil
+			}
+
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(absPath, relPath string) {
+				defer func() { <-sem; wg.Done() }()
+				secrets, err := scanFileForSecrets(absPath, relPath, pipeline)
+				if err != nil {
+					fmt.Printf("Error scanning file %s: %v\n", absPath, err)
+					return
+				}
+				mu.Lock()
+				secretsFound = append(secretsFound, secrets...)
+				mu.Unlock()
+			}(path, rel)
+			return nil
+		})
+		if err != nil {
+			fmt.Println("Error walking the directory:", err)
+			os.Exit(1)
+		}
+
+		wg.Wait()
+	}
+	statusPrint("Found %d potential secrets in current files\n", len(secretsFound))
+
+	// PHASE 2: Scan git history (no LLM - can't access file content at old commits)
+	// Git history scanning is ON by default. Use --no-git-history to skip.
+	if isGitRepo && !*noGitHistory {
+		statusPrint("\nPhase 2: Scanning git history...\n")
+		var err error
+		historySecrets, err = scanGitHistory(dir, *gitMaxCommits, *gitRef, *gitSinceDate, nil) // nil pipeline = no LLM
+		if err != nil {
+			statusPrint("%sWarning: Git history scan failed: %v%s\n", YellowColor, err, ResetColor)
+		} else {
+			statusPrint("Found %d potential secrets in git history\n", len(historySecrets))
+			secretsFound = append(secretsFound, historySecrets...)
+		}
+	} else if !isGitRepo {
+		statusPrint("\nSkipping git history scan (not a git repository)\n")
+	} else if *noGitHistory {
+		statusPrint("\nSkipping git history scan (--no-git-history)\n")
 	}
 
-	wg.Wait()
+	statusPrint("\nTotal: %d potential secrets found\n\n", len(secretsFound))
+
+	// Apply config-based filtering (allowlists, disabled rules, entropy threshold)
+	secretsFound = filterSecretsByConfig(secretsFound, compiledConfig)
+
+	// Apply baseline filtering (suppress known findings)
+	secretsFound = filterSecretsByBaseline(secretsFound, loadedBaseline)
+
+	// Update baseline if requested
+	if *updateBaseline {
+		outputPath := *baselinePath
+		if outputPath == "" {
+			outputPath = filepath.Join(dir, baseline.DefaultBaselineFile)
+		}
+
+		// Add all current findings to baseline
+		for _, s := range secretsFound {
+			entry := baseline.CreateEntry(s.FilePath, s.LineNumber, s.RuleID, s.Match, *baselineReason)
+			loadedBaseline.Add(entry)
+		}
+
+		if err := loadedBaseline.Save(outputPath); err != nil {
+			fmt.Printf("%sError saving baseline: %v%s\n", RedColor, err, ResetColor)
+			os.Exit(1)
+		}
+		fmt.Printf("%sBaseline updated: %s (%d entries)%s\n", GreenColor, outputPath, loadedBaseline.Count(), ResetColor)
+	}
 
 	mode := strings.ToLower(*modeFlag)
 	if mode != "detect" && mode != "protect" && mode != "report" {
@@ -302,6 +607,33 @@ func main() {
 		if confidenceScore(s.Confidence) >= failThreshold {
 			shouldFail = true
 			break
+		}
+	}
+
+	// For JSON/SARIF modes, print a summary to stderr so it shows in CI logs
+	if (output == "json" || output == "sarif") && len(secretsFound) > 0 {
+		fmt.Fprintf(os.Stderr, "\n--- Secrets Found (%d) ---\n\n", len(secretsFound))
+		for i, s := range secretsFound {
+			r := maybeRedactSecret(s, redact)
+
+			// Truncate match for display
+			match := r.Match
+			if len(match) > 60 {
+				match = match[:57] + "..."
+			}
+
+			fmt.Fprintf(os.Stderr, "  #%d\n", i+1)
+			fmt.Fprintf(os.Stderr, "    File:       %s\n", r.FilePath)
+			fmt.Fprintf(os.Stderr, "    Line:       %d\n", r.LineNumber)
+			fmt.Fprintf(os.Stderr, "    Confidence: %s\n", strings.ToUpper(r.Confidence))
+			fmt.Fprintf(os.Stderr, "    Match:      %s\n", match)
+			if r.Verified {
+				fmt.Fprintf(os.Stderr, "    Verified:   YES (LLM)\n")
+			}
+			if r.VerificationReason != "" {
+				fmt.Fprintf(os.Stderr, "    Reason:     %s\n", r.VerificationReason)
+			}
+			fmt.Fprintf(os.Stderr, "\n")
 		}
 	}
 
@@ -392,13 +724,20 @@ func displaySecret(secret Secret) {
 		confidenceColor = RedColor
 	}
 
-	fmt.Printf("\n%sFile:%s %s\n", YellowColor, ResetColor, secret.File)
+	fmt.Printf("\n%s───────────────────────────────────────────────────────%s\n", YellowColor, ResetColor)
+	fmt.Printf("%sFile:%s %s\n", YellowColor, ResetColor, secret.File)
 	fmt.Printf("%sLine Number:%s %d\n", YellowColor, ResetColor, secret.LineNumber)
 	fmt.Printf("%sConfidence:%s %s%s%s (Entropy: %.2f)\n",
 		YellowColor, ResetColor, confidenceColor, strings.ToUpper(secret.Confidence), ResetColor, secret.Entropy)
 	fmt.Printf("%sContext:%s %s\n", YellowColor, ResetColor, secret.Context)
 	fmt.Printf("%sPattern:%s %s\n", YellowColor, ResetColor, secret.Type)
 	fmt.Printf("%sLine:%s %s\n", YellowColor, ResetColor, secret.Line)
+	if secret.Verified {
+		fmt.Printf("%sVerified:%s YES (LLM)\n", YellowColor, ResetColor)
+	}
+	if secret.VerificationReason != "" {
+		fmt.Printf("%sReason:%s %s\n", YellowColor, ResetColor, secret.VerificationReason)
+	}
 }
 
 func maybeRedactSecret(s Secret, redact bool) Secret {
@@ -538,8 +877,235 @@ func emitSarif(secrets []Secret, redact bool) error {
 	return enc.Encode(report)
 }
 
-func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret, error) {
-	file, err := os.Open(path)
+// filterSecretsByConfig removes findings that match config allowlists or disabled rules.
+func filterSecretsByConfig(secrets []Secret, cc *config.CompiledConfig) []Secret {
+	if cc == nil {
+		return secrets
+	}
+
+	minEntropy := cc.GetMinEntropy()
+	var filtered []Secret
+
+	for _, s := range secrets {
+		// Skip if path is in allowlist
+		if !cc.IsPathAllowed(s.FilePath) {
+			continue
+		}
+
+		// Skip if secret value is in allowlist
+		if cc.IsSecretAllowed(s.Match) {
+			continue
+		}
+
+		// Skip if rule is disabled
+		if cc.IsRuleDisabled(s.RuleID) {
+			continue
+		}
+
+		// Skip if entropy is below threshold (unless it's a high-confidence pattern)
+		if s.Entropy < minEntropy && s.Confidence != "critical" && s.Confidence != "high" {
+			continue
+		}
+
+		filtered = append(filtered, s)
+	}
+
+	return filtered
+}
+
+// filterSecretsByBaseline removes findings that are in the baseline.
+func filterSecretsByBaseline(secrets []Secret, b *baseline.Baseline) []Secret {
+	if b == nil || b.Count() == 0 {
+		return secrets
+	}
+
+	var filtered []Secret
+	for _, s := range secrets {
+		if !b.IsBaselined(s.FilePath, s.RuleID, s.Match) {
+			filtered = append(filtered, s)
+		}
+	}
+
+	return filtered
+}
+
+// GitCommit represents a commit in git history.
+type GitCommit struct {
+	Hash    string
+	Author  string
+	Date    string
+	Message string
+}
+
+// scanGitHistory scans git commit history for secrets.
+func scanGitHistory(repoDir string, maxCommits int, ref, sinceDate string, pipeline *verification.Pipeline) ([]Secret, error) {
+	// Get list of commits
+	args := []string{"log", "--format=%H|%an|%ai|%s", ref}
+	if maxCommits > 0 {
+		args = append(args, fmt.Sprintf("-n%d", maxCommits))
+	}
+	if sinceDate != "" {
+		args = append(args, "--since="+sinceDate)
+	}
+
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git log failed: %w", err)
+	}
+
+	var commits []GitCommit
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		commits = append(commits, GitCommit{
+			Hash:    parts[0],
+			Author:  parts[1],
+			Date:    parts[2],
+			Message: parts[3],
+		})
+	}
+
+	var allSecrets []Secret
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Use worker pool for parallel commit scanning
+	workers := runtime.NumCPU() * 2
+	if workers < 4 {
+		workers = 4
+	}
+	sem := make(chan struct{}, workers)
+
+	for _, commit := range commits {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(c GitCommit) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			secrets, err := scanCommitDiff(repoDir, c, pipeline)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to scan commit %s: %v\n", c.Hash[:8], err)
+				return
+			}
+
+			if len(secrets) > 0 {
+				mu.Lock()
+				allSecrets = append(allSecrets, secrets...)
+				mu.Unlock()
+			}
+		}(commit)
+	}
+
+	wg.Wait()
+	return allSecrets, nil
+}
+
+// scanCommitDiff scans the diff of a single commit for secrets.
+func scanCommitDiff(repoDir string, commit GitCommit, pipeline *verification.Pipeline) ([]Secret, error) {
+	// Get the diff for this commit
+	cmd := exec.Command("git", "show", "--format=", "--unified=0", commit.Hash)
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	return scanDiffContent(out, commit, pipeline)
+}
+
+// scanDiffContent scans diff output for secrets.
+func scanDiffContent(diffData []byte, commit GitCommit, pipeline *verification.Pipeline) ([]Secret, error) {
+	var secrets []Secret
+	var currentFile string
+	lineNum := 0
+
+	scanner := bufio.NewScanner(bytes.NewReader(diffData))
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Track current file from diff headers
+		if strings.HasPrefix(line, "+++ b/") {
+			currentFile = strings.TrimPrefix(line, "+++ b/")
+			lineNum = 0
+			continue
+		}
+
+		// Track line numbers from @@ headers
+		if strings.HasPrefix(line, "@@") {
+			// Parse @@ -old,count +new,count @@
+			parts := strings.Split(line, " ")
+			for _, p := range parts {
+				if strings.HasPrefix(p, "+") && !strings.HasPrefix(p, "+++") {
+					numPart := strings.TrimPrefix(p, "+")
+					if idx := strings.Index(numPart, ","); idx > 0 {
+						numPart = numPart[:idx]
+					}
+					fmt.Sscanf(numPart, "%d", &lineNum)
+					break
+				}
+			}
+			continue
+		}
+
+		// Only scan added lines (lines starting with +)
+		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
+			if strings.HasPrefix(line, "+") {
+				lineNum++
+			}
+			continue
+		}
+
+		// Remove the leading + for scanning
+		content := strings.TrimPrefix(line, "+")
+		lineNum++
+
+		// Scan this line for secrets
+		for i, pattern := range compiledPatterns {
+			if pattern.MatchString(content) {
+				match := pattern.FindString(content)
+				entropy := calculateEntropy(match)
+				context := detectContext(currentFile, content)
+				confidence := calculateConfidence(match, entropy, context, secretPatterns[i])
+
+				secret := Secret{
+					File:       currentFile,
+					FilePath:   fmt.Sprintf("%s@%s", currentFile, commit.Hash[:8]),
+					LineNumber: lineNum,
+					Line:       content,
+					Match:      match,
+					RuleID:     fmt.Sprintf("pattern-%d", i),
+					Type:       secretPatterns[i],
+					Confidence: confidence,
+					Entropy:    entropy,
+					Context:    fmt.Sprintf("%s (commit: %s by %s)", context, commit.Hash[:8], commit.Author),
+				}
+
+				// Note: LLM verification is skipped for git history scanning
+				// because we don't have access to the full file content at that commit.
+				// The finding is still reported with the pattern-based confidence.
+
+				secrets = append(secrets, secret)
+				break // One match per line
+			}
+		}
+	}
+
+	return secrets, scanner.Err()
+}
+
+func scanFileForSecrets(absPath, relPath string, pipeline *verification.Pipeline) ([]Secret, error) {
+	file, err := os.Open(absPath)
 	if err != nil {
 		return nil, err
 	}
@@ -552,12 +1118,19 @@ func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret,
 
 	lineNumber := 1
 	var secrets []Secret
+	seenLines := make(map[int]bool) // Track which lines already have findings to avoid duplicates
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		// Skip lines that are clearly regex pattern definitions
 		if isRegexPatternLine(line) {
+			lineNumber++
+			continue
+		}
+
+		// Skip if we already found a secret on this line (avoid duplicates from overlapping patterns)
+		if seenLines[lineNumber] {
 			lineNumber++
 			continue
 		}
@@ -597,7 +1170,7 @@ func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret,
 				entropy := calculateEntropy(matchedSecret)
 
 				// Detect context of the finding
-				context := detectContext(path, line)
+				context := detectContext(relPath, line)
 
 				// Calculate confidence based on entropy and context
 				confidence := calculateConfidence(matchedSecret, entropy, context, secretPatterns[index])
@@ -605,7 +1178,7 @@ func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret,
 				// Use LLM verification if available
 				if pipeline != nil && confidence != "low" {
 					result, err := pipeline.VerifyFinding(
-						path,
+						relPath,
 						lineNumber,
 						line,
 						secretPatterns[index],
@@ -621,12 +1194,12 @@ func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret,
 
 						// LLM is advisory-only: attach reasoning but do not suppress regex hits.
 						secrets = append(secrets, Secret{
-							File:               fmt.Sprintf("%s (%s) [LLM: %s]", path, secretType, result.Reasoning),
-							FilePath:           path,
+							File:               fmt.Sprintf("%s (%s) [LLM: %s]", relPath, secretType, result.Reasoning),
+							FilePath:           relPath,
 							LineNumber:         lineNumber,
 							Line:               line,
 							Match:              matchedSecret,
-							RuleID:             fmt.Sprintf("pattern-%d", index),
+							RuleID:             fmt.Sprintf(ruleIDFmt, index),
 							Type:               secretPatterns[index],
 							Confidence:         confidence,
 							Entropy:            entropy,
@@ -634,37 +1207,40 @@ func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret,
 							Verified:           result.IsRealSecret,
 							VerificationReason: result.Reasoning,
 						})
+						seenLines[lineNumber] = true
 					} else {
 						// Fall back to non-LLM if verification fails
 						if confidence != "low" {
 							secrets = append(secrets, Secret{
-								File:       fmt.Sprintf("%s (%s)", path, secretType),
-								FilePath:   path,
+								File:       fmt.Sprintf("%s (%s)", relPath, secretType),
+								FilePath:   relPath,
 								LineNumber: lineNumber,
 								Line:       line,
 								Match:      matchedSecret,
-								RuleID:     fmt.Sprintf("pattern-%d", index),
+								RuleID:     fmt.Sprintf(ruleIDFmt, index),
 								Type:       secretPatterns[index],
 								Confidence: confidence,
 								Entropy:    entropy,
 								Context:    context,
 							})
+							seenLines[lineNumber] = true
 						}
 					}
 				} else if confidence != "low" {
 					// No LLM pipeline or low confidence - use standard detection
 					secrets = append(secrets, Secret{
-						File:       fmt.Sprintf("%s (%s)", path, secretType),
-						FilePath:   path,
+						File:       fmt.Sprintf("%s (%s)", relPath, secretType),
+						FilePath:   relPath,
 						LineNumber: lineNumber,
 						Line:       line,
 						Match:      matchedSecret,
-						RuleID:     fmt.Sprintf("pattern-%d", index),
+						RuleID:     fmt.Sprintf(ruleIDFmt, index),
 						Type:       secretPatterns[index],
 						Confidence: confidence,
 						Entropy:    entropy,
 						Context:    context,
 					})
+					seenLines[lineNumber] = true
 				}
 				break
 			}
@@ -679,49 +1255,120 @@ func scanFileForSecrets(path string, pipeline *verification.Pipeline) ([]Secret,
 }
 
 func AdditionalSecretPatterns() []string {
-	vulnerabilityPatterns := []string{
-		// Add your additional regex patterns here
-		`(?i)(<\s*script\b[^>]*>(.*?)<\s*/\s*script\s*>)`,                      // Cross-site scripting (XSS)
-		`(?i)(\b(?:or|and)\b\s*[\w-]*\s*=\s*[\w-]*\s*\b(?:or|and)\b\s*[^\s]+)`, // SQL injection
-		`(?i)(['"\s]exec(?:ute)?\s*[(\s]*\s*@\w+\s*)`,                          // SQL injection (EXEC, EXECUTE)
-		`(?i)(['"\s]union\s*all\s*select\s*[\w\s,]+(?:from|into|where)\s*\w+)`, // SQL injection (UNION ALL SELECT)
-		// Private SSH keys
-		`-----BEGIN\sRSA\sPRIVATE\sKEY-----[\s\S]+-----END\sRSA\sPRIVATE\sKEY-----`,
-		// S3 Bucket URLs
+	// Additional patterns that complement the core set - focus on less common services
+	return []string{
+		// S3 Bucket URLs (may indicate misconfiguration)
 		`(?i)s3\.amazonaws\.com/[\w\-\.]+`,
-		// Note: IP address pattern removed - too many false positives in docs/examples
-		// If needed, filter reserved IPs (127.0.0.1, RFC1918) before reporting
-		// Basic Authentication credentials
-		`(?i)(?:http|https)://\w+:\w+@[\w\-\.]+`,
-		// JWT tokens
-		`(?i)ey(?:J[a-zA-Z0-9_-]+)[.](?:[a-zA-Z0-9_-]+)[.](?:[a-zA-Z0-9_-]+)`,
-		// Connection strings (such as database connections)
-		`(?i)(?:Server|Host)=([\w\.-]+);\s*(?:Port|Database|User\s*ID|Password)=([^;\s]+)(?:;\s*(?:Port|Database|User\s*ID|Password)=([^;\s]+))*`,
-		// Path traversal attempts
-		// `(\.\./|\.\.\\)`,
-		// Open redirects
-		// `(?i)(?:(?:https?|ftp)://|%3A%2F%2F)[^\s&]+(?:\s|%20)*(?:\b(?:and|or)\b\s*[\w-]*\s*=\s*[\w-]*\s*\b(?:and|or)\b\s*[^\s]+)?`,
-		// UPLOAD MISCONFIG
-		//`(?i)enctype\s*=\s*['"]multipart/form-data['"]`,
-		// Headers
-		//`(?i)<(title|head)>`,
-		`(?i)encryPublicKey\s*=\s*"([^"]*)"`,
-		`(?i)decryPrivateKey\s*=\s*"([^"]*)"`,
+		// Windows/ADO connection strings
+		`(?i)(?:Server|Host|Data\s*Source)=([\w\.-]+);\s*(?:Port|Database|Initial\s*Catalog|User\s*ID|Password)=([^;\s]+)`,
+		// Fastly API Token
+		`(?i)fastly[_-]?(?:api[_-]?)?(?:token|key)["'\s:=]+[A-Za-z0-9_-]{32}`,
+		// Contentful
+		`(?i)contentful[_-]?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{43,}`,
+		// Prismic
+		`(?i)prismic[_-]?(?:api[_-]?)?(?:token|key)["'\s:=]+[A-Za-z0-9_-]{40,}`,
+		// Sanity
+		`(?i)sanity[_-]?(?:api[_-]?)?token["'\s:=]+sk[A-Za-z0-9]{60,}`,
+		// Hasura
+		`(?i)hasura[_-]?(?:admin[_-]?)?secret["'\s:=]+[A-Za-z0-9_-]{32,}`,
+		// Supabase (service role key pattern)
+		`(?i)supabase[_-]?(?:service[_-]?)?key["'\s:=]+eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`,
+		// PlanetScale
+		`pscale_tkn_[A-Za-z0-9_-]{43}`,
+		// Turso
+		`(?i)turso[_-]?(?:auth[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{40,}`,
+		// Upstash
+		`(?i)upstash[_-]?redis[_-]?rest[_-]?token["'\s:=]+[A-Za-z0-9_=-]{40,}`,
+		// Convex
+		`(?i)convex[_-]?deploy[_-]?key["'\s:=]+prod:[A-Za-z0-9_-]{40,}`,
+		// Railway
+		`(?i)railway[_-]?token["'\s:=]+[A-Za-z0-9_-]{36,}`,
+		// Render
+		`(?i)render[_-]?api[_-]?key["'\s:=]+rnd_[A-Za-z0-9]{24,}`,
+		// Fly.io
+		`(?i)fly[_-]?(?:api[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{43}`,
+		// Deno Deploy
+		`(?i)deno[_-]?deploy[_-]?token["'\s:=]+[A-Za-z0-9_-]{40,}`,
+		// Expo
+		`(?i)expo[_-]?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{40,}`,
+		// Snyk
+		`(?i)snyk[_-]?(?:api[_-]?)?token["'\s:=]+[0-9a-f-]{36}`,
+		// Codecov
+		`(?i)codecov[_-]?token["'\s:=]+[0-9a-f-]{36}`,
+		// Coveralls
+		`(?i)coveralls[_-]?(?:repo[_-]?)?token["'\s:=]+[A-Za-z0-9]{32,}`,
+		// SonarQube/SonarCloud
+		`(?i)sonar[_-]?(?:token|login)["'\s:=]+[a-f0-9]{40}`,
+		// Terraform Cloud
+		`(?i)(?:tfc|terraform)[_-]?token["'\s:=]+[A-Za-z0-9]{14}\.[A-Za-z0-9]{14}\.[A-Za-z0-9]{21,}`,
+		// HashiCorp Vault
+		`(?i)vault[_-]?token["'\s:=]+(?:hvs\.|s\.)[A-Za-z0-9_-]{24,}`,
+		// Doppler
+		`dp\.(?:ct|pt|st)\.[A-Za-z0-9]{40,}`,
+		// 1Password
+		`ops_[A-Za-z0-9]{43}`,
+		// LastPass
+		`(?i)lastpass[_-]?(?:api[_-]?)?(?:key|token)["'\s:=]+[A-Za-z0-9]{32,}`,
+		// Pulumi
+		`pul-[A-Za-z0-9]{40}`,
+		// Weights & Biases (wandb)
+		`(?i)wandb[_-]?api[_-]?key["'\s:=]+[a-f0-9]{40}`,
+		// Comet ML
+		`(?i)comet[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9]{40}`,
+		// Neptune AI
+		`(?i)neptune[_-]?api[_-]?token["'\s:=]+eyJ[A-Za-z0-9_-]+`,
+		// Roboflow
+		`(?i)roboflow[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9]{40,}`,
+		// Pinecone
+		`(?i)pinecone[_-]?api[_-]?key["'\s:=]+[a-f0-9-]{36}`,
+		// Weaviate
+		`(?i)weaviate[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9_-]{40,}`,
+		// Qdrant
+		`(?i)qdrant[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9_-]{32,}`,
+		// Milvus
+		`(?i)milvus[_-]?(?:api[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{32,}`,
+		// Cohere
+		`(?i)cohere[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9]{40}`,
+		// Mistral AI
+		`(?i)mistral[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9]{32}`,
+		// Together AI
+		`(?i)together[_-]?api[_-]?key["'\s:=]+[a-f0-9]{64}`,
+		// Groq
+		`gsk_[A-Za-z0-9]{52}`,
+		// Perplexity
+		`pplx-[A-Za-z0-9]{48}`,
+		// ElevenLabs
+		`(?i)elevenlabs[_-]?api[_-]?key["'\s:=]+[a-f0-9]{32}`,
+		// AssemblyAI
+		`(?i)assemblyai[_-]?api[_-]?key["'\s:=]+[a-f0-9]{32}`,
+		// Deepgram
+		`(?i)deepgram[_-]?api[_-]?key["'\s:=]+[a-f0-9]{40}`,
+		// Rev AI
+		`(?i)rev[_-]?(?:ai[_-]?)?(?:access[_-]?)?token["'\s:=]+[A-Za-z0-9_-]{40,}`,
+		// Bannerbear
+		`bb_(?:live|test)_[A-Za-z0-9]{32}`,
+		// imgix
+		`(?i)imgix[_-]?(?:api[_-]?)?(?:key|token)["'\s:=]+[A-Za-z0-9_-]{32,}`,
+		// Cloudinary
+		`(?i)cloudinary[_-]?(?:api[_-]?)?secret["'\s:=]+[A-Za-z0-9_-]{27}`,
+		// Uploadcare
+		`(?i)uploadcare[_-]?(?:secret[_-]?)?key["'\s:=]+[a-f0-9]{20}`,
+		// Imgbb
+		`(?i)imgbb[_-]?api[_-]?key["'\s:=]+[a-f0-9]{32}`,
+		// Tenor
+		`(?i)tenor[_-]?api[_-]?key["'\s:=]+[A-Z0-9]{16}`,
+		// Giphy
+		`(?i)giphy[_-]?api[_-]?key["'\s:=]+[A-Za-z0-9]{32}`,
 	}
-	return vulnerabilityPatterns
 }
 
 func isRegexPatternLine(line string) bool {
 	// Skip lines that contain regex pattern definitions (backtick-quoted strings with regex)
 	// Common in source code defining patterns
-	trimmed := regexp.MustCompile(`^\s+`).ReplaceAllString(line, "")
+	trimmed := strings.TrimLeft(line, " \t")
 
 	// Check if line is a regex pattern definition (starts with backtick or contains backtick with regex chars)
-	if regexp.MustCompile("^`.*(?:\\(\\?i\\)|\\\\s|\\\\d|\\[|\\]|\\{|\\}|\\||\\^|\\$).*`").MatchString(trimmed) {
-		return true
-	}
-
-	return false
+	return regexLinePattern.MatchString(trimmed)
 }
 
 func shouldIgnoreDir(path string) bool {
@@ -759,13 +1406,25 @@ func shouldIgnoreFile(info os.FileInfo) bool {
 	return false
 }
 
-func matchAnyGlob(path string, patterns []string) bool {
+func matchAnyGlob(relPath string, patterns []string) bool {
 	for _, p := range patterns {
 		if p == "" {
 			continue
 		}
-		if ok, _ := filepath.Match(p, path); ok {
+		// Try matching on full relative path
+		if ok, _ := filepath.Match(p, relPath); ok {
 			return true
+		}
+		// Also try matching on just the basename for simple patterns
+		if ok, _ := filepath.Match(p, filepath.Base(relPath)); ok {
+			return true
+		}
+		// Support "dir/*" style: check if pattern prefix matches path segments
+		if strings.HasSuffix(p, "/*") {
+			prefix := strings.TrimSuffix(p, "/*")
+			if strings.HasPrefix(relPath, prefix+"/") || relPath == prefix {
+				return true
+			}
 		}
 	}
 	return false
